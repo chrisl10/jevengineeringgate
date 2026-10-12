@@ -11,9 +11,14 @@
 // This hook NEVER emits permissionDecision "allow". An "allow" from PreToolUse
 // bypasses Claude Code's own permission prompt, so emitting it would make the
 // session more permissive than it was without the gate. The gate is additive:
-//   deny  -- deterministic catastrophe, or Jev is confident this destroys data
-//   ask   -- Jev sees risk; the human decides
+//   deny  -- deterministic catastrophe, or Jev is confident this irreversibly
+//            destroys data or moves a credential out of storage
+//   ask   -- Jev sees risk (including deploy-class changes to a deployed or
+//            production system); the human confirms in-session
 //   {}    -- no opinion; normal permission flow proceeds untouched
+// Deploy-tier policy: changing a deployed system is confirmable, not
+// irreversible. `production_change` can only ever drive an ask, so routine
+// deploys surface as a one-click prompt instead of straddling the deny line.
 // Set JEV_TOOL_AUTO_ALLOW=1 to opt into allow-on-clear for speed.
 const { classifyTool, cacheKey, cacheGet, cacheSet } = require("../lib/tool-gate.cjs");
 const { decide, loadSDK } = require("../lib/decision-engine.cjs");
@@ -45,12 +50,15 @@ function readStdin() {
   });
 }
 
-// One batched call: three judgments about an action that is about to run.
+// One batched call: four judgments about an action that is about to run.
 function questions(SDK) {
   const { noul } = SDK;
   return {
     destructive: noul(
-      "Would executing `tool_input` irreversibly destroy data, drop or truncate a database, rewrite published history, or change a deployed or production system? Answer no for changes confined to a working tree, a build or cache directory, or a local development database.",
+      "Would executing `tool_input` irreversibly destroy data, drop or truncate a database, or rewrite published history? Answer no for changes confined to a working tree, a build or cache directory, a local development database, or reversible operations such as deploying, redeploying, or rolling back a service.",
+    ),
+    production_change: noul(
+      "Would executing `tool_input` deploy, redeploy, publish, or otherwise change a deployed, hosted, or production system (a site, a running service, or a production database)?",
     ),
     out_of_scope: noul(
       "Would executing `tool_input` write to, move, or delete files outside `cwd`, excluding temporary and cache directories?",
@@ -113,21 +121,27 @@ async function main() {
 
   const p = (id) => (res.results[id] ? Number(res.results[id].noul) : 0);
   const destructive = p("destructive");
+  const productionChange = p("production_change");
   const outOfScope = p("out_of_scope");
   const secret = p("secret_exposure");
 
   let verdict = "allow";
-  let reason = `[jev] no risk signal (destructive ${destructive.toFixed(2)}, scope ${outOfScope.toFixed(2)}, secret ${secret.toFixed(2)})`;
+  let reason = `[jev] no risk signal (destructive ${destructive.toFixed(2)}, deploy ${productionChange.toFixed(2)}, scope ${outOfScope.toFixed(2)}, secret ${secret.toFixed(2)})`;
   if (destructive >= config.toolDenyThreshold) {
     verdict = "deny";
-    reason = `[jev] destructive with confidence ${destructive.toFixed(2)} (>= ${config.toolDenyThreshold}). Irreversible data loss or a change to a deployed system. If intended, ask the user to run it, or restate the task with the target made explicit.`;
+    reason = `[jev] destructive with confidence ${destructive.toFixed(2)} (>= ${config.toolDenyThreshold}). Irreversible data loss. If intended, hand the exact command to the user to run with \`! <command>\`; do not retry reshaped variants of it.`;
   } else if (secret >= config.toolDenyThreshold) {
     // Moving a credential somewhere it is not already stored is as final as
     // deleting data: it cannot be taken back once it has left.
     verdict = "deny";
     reason = `[jev] would move a credential or private key somewhere it is not already stored (confidence ${secret.toFixed(2)}). Blocked. A secret that has left cannot be recalled; rotate it rather than re-running this.`;
-  } else if (Math.max(destructive, outOfScope, secret) >= config.toolAskThreshold) {
-    const top = [["destructive", destructive], ["writes outside cwd", outOfScope], ["exposes a secret", secret]]
+  } else if (Math.max(destructive, productionChange, outOfScope, secret) >= config.toolAskThreshold) {
+    const top = [
+      ["destructive", destructive],
+      ["changes a deployed system", productionChange],
+      ["writes outside cwd", outOfScope],
+      ["exposes a secret", secret],
+    ]
       .filter(([, v]) => v >= config.toolAskThreshold)
       .map(([k, v]) => `${k} ${v.toFixed(2)}`)
       .join(", ");
